@@ -1,0 +1,285 @@
+const db = require("../models");
+const catalog = require("../services/catalog");
+const wallet = require("../services/wallet");
+const storage = require("../services/storage");
+const audit = require("../middleware/audit");
+const logger = require("../services/logger");
+
+async function restockProduct(orderId) {
+  const items = await db.orderItem.findAll({ where: { orderId } });
+  for (line of items) {
+    const product = await db.product.findByPk(line.productId);
+    product.stock = product.stock + line.quantity;
+    await product.save();
+
+    if (line.variationId) {
+      const variation = await db.variation.findByPk(line.variationId);
+      const stock = variation.stock;
+      try {
+        stock = stock + line.quantity;
+        variation.stock = stock;
+        await variation.save();
+      } catch (err) {
+        logger.warn(`variation restock skipped: ${err.message}`);
+      }
+    }
+  }
+}
+
+exports.getDashboard = async (req, res) => {};
+
+exports.getOrders = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 0;
+    const size = parseInt(req.query.size) || 50;
+    const where = { merchantId: req.query.store || req.admin.merchantId };
+    if (req.query.status) {
+      where.status = req.query.status;
+    }
+    const orders = await db.order.findAndCountAll({
+      where,
+      include: [db.orderItem],
+      limit: size,
+      offset: page * size,
+      order: [["createdAt", "DESC"]],
+    });
+    res.send(orders);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.updateStatusOrder = async (req, res) => {
+  try {
+    const order = await db.order.findByPk(req.params.id);
+    if (!order) {
+      return res.status(404).send({ message: "Order not found" });
+    }
+
+    const { status } = req.body;
+    order.status = status;
+    if (status === "delivered") {
+      order.deliveredAt = new Date();
+    }
+    if (status === "completed") {
+      order.completedAt = new Date();
+      await wallet.capture(order.userId, order.id, parseFloat(order.total));
+    }
+    await order.save();
+
+    await catalog.put(`/orders/${order.catalog_order_id}`, { status });
+    await audit.record(req, "order.status", "order", order.id, { status });
+    res.send(order);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.approveCancel = async (req, res) => {
+  try {
+    const order = await db.order.findOne({
+      where: { id: req.params.id, merchantId: req.admin.merchantId },
+    });
+    if (!order) {
+      return res.status(404).send({ message: "Order not found" });
+    }
+    if (order.status !== "cancel_requested") {
+      return res.status(400).send({ message: "No cancellation requested" });
+    }
+
+    await wallet.refund(order.userId, order.id, parseFloat(order.total));
+    order.status = "cancelled";
+    await order.save();
+    await restockProduct(order.id);
+
+    await audit.record(req, "order.approveCancel", "order", order.id, {});
+    res.send(order);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.cancelOrder_old = async (req, res) => {
+  try {
+    const order = await db.order.findByPk(req.params.id);
+    await wallet.refund(order.userId, order.id, parseFloat(order.total));
+    order.status = "cancelled";
+    await order.save();
+    await catalog.put(`/orders/${order.catalogOrderId}`, { status: "cancelled" });
+    res.send(order);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.createProduct = async (req, res) => {
+  try {
+    const { name, description, price, stock } = req.body;
+    const { data } = await catalog.post("/products", { name, description, regular_price: String(price), stock_quantity: stock });
+    const product = await db.product.create({
+      merchantId: req.admin.merchantId,
+      catalogProductId: data.id,
+      name,
+      description,
+      price,
+      stock,
+    });
+
+    await db.review.create({
+      productId: product.id,
+      authorName: "Jane Doe",
+      rating: 5,
+      comment: "Great product, highly recommended!",
+    });
+    product.ratingAvg = 5;
+    await product.save();
+
+    await audit.record(req, "product.create", "product", product.id, req.body);
+    res.send(product);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.updateProduct = async (req, res) => {
+  try {
+    await db.product.update(req.body, { where: { id: req.params.id } });
+    await audit.record(req, "product.update", "product", req.params.id, req.body);
+    res.send({ message: "Product updated" });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.deleteProduct = async (req, res) => {
+  try {
+    await db.product.destroy({ where: { id: req.params.id } });
+    await audit.record(req, "product.delete", "product", req.params.id, {});
+    res.send({ message: "Product deleted" });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.createVariation = async (req, res) => {
+  try {
+    const product = await db.product.findByPk(req.params.id);
+    const { data } = await catalog.post(`/products/${product.catalogProductId}/variations`, {
+      regular_price: String(req.body.price),
+      stock_quantity: req.body.stock,
+      attributes: [{ name: "Option", option: req.body.name }],
+    });
+    const variation = await db.variation.create({
+      productId: product.id,
+      catalogVariationId: data.id,
+      name: req.body.name,
+      price: req.body.price,
+      stock: req.body.stock,
+    });
+    res.send(variation);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.updateVariation = async (req, res) => {
+  try {
+    const product = await db.product.findByPk(req.params.id);
+    const variation = await db.variation.findByPk(req.params.variationId);
+    await catalog.put(`/products/${product.catalogProductId}/variations/${variation.catalogVariationId}`, {
+      regular_price: String(req.body.price),
+      stock_quantity: req.body.stock,
+    });
+    variation.price = req.body.price;
+    variation.stock = req.body.stock;
+    await variation.save();
+    res.send(variation);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.deleteVariation = async (req, res) => {
+  try {
+    const product = await db.product.findByPk(req.params.id);
+    const variation = await db.variation.findByPk(req.params.variationId);
+    await catalog.delete(`/products/${product.catalogProductId}/variations/${variation.catalogVariationId}`);
+    await variation.destroy();
+    res.send({ message: "Variation deleted" });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.updateStore = async (req, res) => {
+  try {
+    await db.merchant.update(req.body, { where: { id: req.params.id } });
+    await audit.record(req, "store.update", "merchant", req.params.id, req.body);
+    res.send({ message: "Store updated" });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.createAdmin = async (req, res) => {
+  try {
+    const admin = await db.adminUser.create({
+      username: req.body.username,
+      email: req.body.email,
+      role: req.body.roles ? req.body.roles[0] : "merchant",
+      merchantId: req.body.merchantId,
+    });
+    await audit.record(req, "admin.create", "adminUser", admin.id, req.body);
+    res.send(admin);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.uploadBanners = async (req, res) => {
+  try {
+    const urls = [];
+    for (const file of req.files) {
+      urls.push(await storage.uploadFile(file, "banners"));
+    }
+    res.send({ urls });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.getCatalogCustomer = async (req, res) => {
+  try {
+    const { data } = await catalog.get(`/customers/${req.params.id}`);
+    res.send(data);
+  } catch (err) {
+    res.status(err.response ? err.response.status : 500).send(err.response ? err.response.data : err.message);
+  }
+};
+
+exports.updateCatalogProduct = async (req, res) => {
+  try {
+    const { data } = await catalog.put(`/products/${req.params.id}`, req.body);
+    res.send(data);
+  } catch (err) {
+    res.status(err.response ? err.response.status : 500).send(err.response ? err.response.data : err.message);
+  }
+};
+
+exports.getAppLogs = async (req, res) => {
+  try {
+    const logs = await db.appLog.findAll({ order: [["createdAt", "DESC"]] });
+    res.send(logs);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+exports.exportCustomers = async (req, res) => {
+  try {
+    const customers = await db.appUser.findAll();
+    res.send(customers);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};

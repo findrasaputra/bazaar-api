@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+  upstream:
+    image: node:20
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: node mock/upstream.js
+    ports:
+      - "9000:9000"
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DB_HOST: db
+      AUTH_SERVICE_URL: http://upstream:9000/auth
+      CATALOG_URL: http://upstream:9000/catalog
+    depends_on:
+      - db
+      - upstream
+    ports:
+      - "8080:8080"

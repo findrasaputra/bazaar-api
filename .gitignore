@@ -1,0 +1,13 @@
+node_modules/
+uploads/
+npm-debug.log
+
+# Credentials / private data
+.env
+.env.*
+!.env.example
+config/warehouse-key.json
+
+# Documentation (incl. answer key and review report)
+*.md
+!README.md
