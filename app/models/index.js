@@ -153,7 +153,7 @@ db.auditLog = sequelize.define("auditLog", {
 }, { tableName: "audit_logs" });
 
 db.jobLock = sequelize.define("jobLock", {
-  name: DataTypes.STRING,
+  name: { type: DataTypes.STRING, unique: true },
   lockedAt: DataTypes.DATE,
 }, { tableName: "job_locks" });
 

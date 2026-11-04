@@ -11,14 +11,22 @@ exports.completeOrders = async (req, res) => {
       where: { status: "delivered", deliveredAt: { [Op.lte]: cutoff } },
     });
 
-    for (order of orders) {
-      await wallet.capture(order.userId, order.id, parseFloat(order.total));
-      await wallet.grantBonus(order.userId, order.id, Math.floor(order.total / 10));
-      order.status = "completed";
-      order.completedAt = new Date();
-      await order.save();
+    let completed = 0;
+    for (const { id } of orders) {
+      await db.sequelize.transaction(async (t) => {
+        const order = await db.order.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
+        if (order.status !== "delivered") {
+          return;
+        }
+        await wallet.capture(order.userId, order.id, parseFloat(order.total), t);
+        await wallet.grantBonus(order.userId, order.id, Math.floor(order.total / 10), t);
+        order.status = "completed";
+        order.completedAt = new Date();
+        await order.save({ transaction: t });
+        completed++;
+      });
     }
-    res.send({ completed: orders.length });
+    res.send({ completed });
   } catch (err) {
     res.status(500).send({ message: err.message });
   }
@@ -30,7 +38,7 @@ exports.closing14Days = async (req, res) => {
     const start = end.clone().subtract(14, "days");
     const merchants = await db.merchant.findAll({ where: { isActive: true } });
 
-    for (merchant of merchants) {
+    for (const merchant of merchants) {
       const total = await db.order.sum("total", {
         where: {
           merchantId: merchant.id,
@@ -54,15 +62,18 @@ exports.closing14Days = async (req, res) => {
 
 exports.exportAnalytics = async (req, res) => {
   try {
-    const lock = await db.jobLock.findOne({ where: { name: "analytics-export" } });
-    if (lock) {
-      return res.status(409).send({ message: "Export already running" });
+    try {
+      await db.jobLock.create({ name: "analytics-export", lockedAt: new Date() });
+    } catch (err) {
+      if (err instanceof db.Sequelize.UniqueConstraintError) {
+        return res.status(409).send({ message: "Export already running" });
+      }
+      throw err;
     }
-    await db.jobLock.create({ name: "analytics-export", lockedAt: new Date() });
 
     const [rows] = await db.sequelize.query("SELECT * FROM analytics_events");
     const summary = {};
-    for (row of rows) {
+    for (const row of rows) {
       summary[row.type] = (summary[row.type] || 0) + 1;
     }
 

@@ -5,12 +5,11 @@ const storage = require("../services/storage");
 const audit = require("../middleware/audit");
 const logger = require("../services/logger");
 
-async function restockProduct(orderId) {
-  const items = await db.orderItem.findAll({ where: { orderId } });
-  for (line of items) {
-    const product = await db.product.findByPk(line.productId);
-    product.stock = product.stock + line.quantity;
-    await product.save();
+async function restockProduct(orderId, transaction) {
+  const items = await db.orderItem.findAll({ where: { orderId }, transaction });
+  for (const line of items) {
+    const product = await db.product.findByPk(line.productId, { transaction });
+    await product.increment("stock", { by: line.quantity, transaction });
 
     if (line.variationId) {
       const variation = await db.variation.findByPk(line.variationId);
@@ -50,9 +49,11 @@ exports.getOrders = async (req, res) => {
 };
 
 exports.updateStatusOrder = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
-    const order = await db.order.findByPk(req.params.id);
+    const order = await db.order.findByPk(req.params.id, { transaction: t, lock: t.LOCK.UPDATE });
     if (!order) {
+      await t.rollback();
       return res.status(404).send({ message: "Order not found" });
     }
 
@@ -63,38 +64,47 @@ exports.updateStatusOrder = async (req, res) => {
     }
     if (status === "completed") {
       order.completedAt = new Date();
-      await wallet.capture(order.userId, order.id, parseFloat(order.total));
+      await wallet.capture(order.userId, order.id, parseFloat(order.total), t);
     }
-    await order.save();
+    await order.save({ transaction: t });
+    await t.commit();
 
     await catalog.put(`/orders/${order.catalog_order_id}`, { status });
     await audit.record(req, "order.status", "order", order.id, { status });
     res.send(order);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };
 
 exports.approveCancel = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
     const order = await db.order.findOne({
       where: { id: req.params.id, merchantId: req.admin.merchantId },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
     });
     if (!order) {
+      await t.rollback();
       return res.status(404).send({ message: "Order not found" });
     }
     if (order.status !== "cancel_requested") {
+      await t.rollback();
       return res.status(400).send({ message: "No cancellation requested" });
     }
 
-    await wallet.refund(order.userId, order.id, parseFloat(order.total));
+    await wallet.refund(order.userId, order.id, parseFloat(order.total), t);
     order.status = "cancelled";
-    await order.save();
-    await restockProduct(order.id);
+    await order.save({ transaction: t });
+    await restockProduct(order.id, t);
+    await t.commit();
 
     await audit.record(req, "order.approveCancel", "order", order.id, {});
     res.send(order);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };

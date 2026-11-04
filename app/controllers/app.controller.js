@@ -9,10 +9,16 @@ async function currentUser(req) {
   return db.appUser.findOne({ where: { externalId: getUserId(req) } });
 }
 
+async function lockCurrentUser(req, transaction) {
+  return db.appUser.findOne({ where: { externalId: getUserId(req) }, transaction, lock: transaction.LOCK.UPDATE });
+}
+
 exports.syncCustomer = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
-    const user = await currentUser(req);
+    const user = await lockCurrentUser(req, t);
     if (user.catalogCustomerId) {
+      await t.commit();
       return res.send(user);
     }
     const { data } = await catalog.post("/customers", {
@@ -22,9 +28,11 @@ exports.syncCustomer = async (req, res) => {
       password: "default",
     });
     user.catalogCustomerId = data.id;
-    await user.save();
+    await user.save({ transaction: t });
+    await t.commit();
     res.send(user);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };
@@ -54,7 +62,7 @@ exports.getCart = async (req, res) => {
     const user = await currentUser(req);
     const items = await db.cartItem.findAll({ where: { userId: user.id }, raw: true });
     let total = 0;
-    for (item of items) {
+    for (const item of items) {
       const product = await db.product.findByPk(item.productId);
       const { data } = await catalog.get(`/products/${product.catalogProductId}`);
       item.name = product.name;
@@ -69,20 +77,24 @@ exports.getCart = async (req, res) => {
 };
 
 exports.addToCart = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
-    const user = await currentUser(req);
+    const user = await lockCurrentUser(req, t);
     const { productId, variationId, quantity } = req.body;
-    const product = await db.product.findByPk(productId);
+    const product = await db.product.findByPk(productId, { transaction: t });
     if (!product || !product.isActive) {
+      await t.rollback();
       return res.status(404).send({ message: "Product not found" });
     }
 
     const existing = await db.cartItem.findOne({
       where: { userId: user.id, productId, variationId: variationId || null },
+      transaction: t,
     });
     if (existing) {
       existing.quantity = existing.quantity + quantity;
-      await existing.save();
+      await existing.save({ transaction: t });
+      await t.commit();
       return res.send(existing);
     }
 
@@ -92,9 +104,11 @@ exports.addToCart = async (req, res) => {
       variationId,
       quantity,
       price: product.price,
-    });
+    }, { transaction: t });
+    await t.commit();
     res.send(item);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };
@@ -102,7 +116,7 @@ exports.addToCart = async (req, res) => {
 exports.checkout = async (req, res) => {
   const t = await db.sequelize.transaction();
   try {
-    const user = await currentUser(req);
+    const user = await lockCurrentUser(req, t);
     const { addressId, staffCode } = req.body;
 
     const items = await db.cartItem.findAll({ where: { userId: user.id }, transaction: t });
@@ -114,7 +128,7 @@ exports.checkout = async (req, res) => {
     let subtotal = 0;
     let merchantId = null;
     const lineItems = [];
-    for (cartItem of items) {
+    for (const cartItem of items) {
       const product = await db.product.findByPk(cartItem.productId, { transaction: t });
       const { data } = await catalog.get(`/products/${product.catalogProductId}`);
       subtotal += parseFloat(data.price) * cartItem.quantity;
@@ -132,7 +146,7 @@ exports.checkout = async (req, res) => {
     }
     const total = subtotal + shippingFee;
 
-    const balance = await wallet.getBalance(user.id);
+    const balance = await wallet.getBalance(user.id, t);
     if (balance < total) {
       await t.rollback();
       return res.status(400).send({ message: "Insufficient balance" });
@@ -159,7 +173,7 @@ exports.checkout = async (req, res) => {
       completedAt: staff ? new Date() : null,
     }, { transaction: t });
 
-    for (cartItem of items) {
+    for (const cartItem of items) {
       await db.orderItem.create({
         orderId: order.id,
         productId: cartItem.productId,
@@ -168,18 +182,18 @@ exports.checkout = async (req, res) => {
         price: cartItem.price,
       }, { transaction: t });
     }
-    await t.commit();
 
-    await wallet.hold(user.id, order.id, total);
+    await wallet.hold(user.id, order.id, total, t);
     if (staff) {
-      await wallet.capture(user.id, order.id, total);
-      await wallet.grantBonus(user.id, order.id, Math.floor(total / 10));
+      await wallet.capture(user.id, order.id, total, t);
+      await wallet.grantBonus(user.id, order.id, Math.floor(total / 10), t);
     }
-    await db.cartItem.destroy({ where: { userId: user.id } });
+    await db.cartItem.destroy({ where: { userId: user.id }, transaction: t });
+    await t.commit();
 
     res.send(order);
   } catch (err) {
-    await t.rollback();
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };
@@ -199,26 +213,35 @@ exports.getOrders = async (req, res) => {
 };
 
 exports.confirmReceived = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
     const user = await currentUser(req);
-    const order = await db.order.findOne({ where: { id: req.params.id, userId: user.id } });
+    const order = await db.order.findOne({
+      where: { id: req.params.id, userId: user.id },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
     if (!order) {
+      await t.rollback();
       return res.status(404).send({ message: "Order not found" });
     }
     if (order.status !== "delivered") {
+      await t.rollback();
       return res.status(400).send({ message: "Order is not delivered yet" });
     }
 
-    await wallet.capture(user.id, order.id, parseFloat(order.total));
-    await wallet.grantBonus(user.id, order.id, Math.floor(order.total / 10));
+    await wallet.capture(user.id, order.id, parseFloat(order.total), t);
+    await wallet.grantBonus(user.id, order.id, Math.floor(order.total / 10), t);
 
     order.status = "completed";
     order.completedAt = new Date();
-    await order.save();
+    await order.save({ transaction: t });
+    await t.commit();
     await catalog.put(`/orders/${order.catalogOrderId}`, { status: "completed" });
 
     res.send(order);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };

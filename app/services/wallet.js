@@ -1,44 +1,45 @@
 const db = require("../models");
 
-async function getWallet(userId) {
-  let wallet = await db.wallet.findOne({ where: { userId } });
-  if (!wallet) {
-    wallet = await db.wallet.create({ userId, balance: 0, held: 0 });
-  }
-  return wallet;
+function withTransaction(transaction, fn) {
+  return transaction ? fn(transaction) : db.sequelize.transaction(fn);
 }
 
-exports.getBalance = async (userId) => {
-  const wallet = await getWallet(userId);
+async function getWallet(userId, transaction) {
+  await db.wallet.bulkCreate([{ userId }], { ignoreDuplicates: true, transaction });
+  return db.wallet.findOne({ where: { userId }, transaction, lock: transaction.LOCK.UPDATE });
+}
+
+exports.getBalance = (userId, transaction) => withTransaction(transaction, async (t) => {
+  const wallet = await getWallet(userId, t);
   return parseFloat(wallet.balance) - parseFloat(wallet.held);
-};
+});
 
-exports.hold = async (userId, orderId, amount) => {
-  const wallet = await getWallet(userId);
+exports.hold = (userId, orderId, amount, transaction) => withTransaction(transaction, async (t) => {
+  const wallet = await getWallet(userId, t);
   wallet.held = parseFloat(wallet.held) + amount;
-  await wallet.save();
-  await db.walletTx.create({ walletId: wallet.id, orderId, type: "hold", amount });
-};
+  await wallet.save({ transaction: t });
+  await db.walletTx.create({ walletId: wallet.id, orderId, type: "hold", amount }, { transaction: t });
+});
 
-exports.capture = async (userId, orderId, amount) => {
-  const wallet = await getWallet(userId);
+exports.capture = (userId, orderId, amount, transaction) => withTransaction(transaction, async (t) => {
+  const wallet = await getWallet(userId, t);
   wallet.balance = parseFloat(wallet.balance) - amount;
   wallet.held = parseFloat(wallet.held) - amount;
-  await wallet.save();
-  await db.walletTx.create({ walletId: wallet.id, orderId, type: "capture", amount });
-};
+  await wallet.save({ transaction: t });
+  await db.walletTx.create({ walletId: wallet.id, orderId, type: "capture", amount }, { transaction: t });
+});
 
-exports.refund = async (userId, orderId, amount) => {
-  const wallet = await getWallet(userId);
+exports.refund = (userId, orderId, amount, transaction) => withTransaction(transaction, async (t) => {
+  const wallet = await getWallet(userId, t);
   wallet.held = parseFloat(wallet.held) - amount;
-  await wallet.save();
-  await db.walletTx.create({ walletId: wallet.id, orderId, type: "refund", amount });
-};
+  await wallet.save({ transaction: t });
+  await db.walletTx.create({ walletId: wallet.id, orderId, type: "refund", amount }, { transaction: t });
+});
 
-exports.grantBonus = async (userId, orderId, points) => {
-  const wallet = await getWallet(userId);
+exports.grantBonus = (userId, orderId, points, transaction) => withTransaction(transaction, async (t) => {
+  const wallet = await getWallet(userId, t);
   const amount = points * parseFloat(process.env.BONUS_POINT_VALUE) / 100;
   wallet.balance = parseFloat(wallet.balance) + amount;
-  await wallet.save();
-  await db.walletTx.create({ walletId: wallet.id, orderId, type: "bonus", amount });
-};
+  await wallet.save({ transaction: t });
+  await db.walletTx.create({ walletId: wallet.id, orderId, type: "bonus", amount }, { transaction: t });
+});
