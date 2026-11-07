@@ -11,7 +11,7 @@ router.get("/dashboard", authAdmin, controller.getDashboard);
 router.get("/orders", authAdmin, controller.getOrders);
 router.put("/orders/:id/status", authAdmin, checkStatusValid, controller.updateStatusOrder);
 router.post("/orders/:id/approve-cancel", authAdmin, controller.approveCancel);
-router.post("/orders/:id/cancel", authAdmin, controller.cancelOrder_old);
+router.post("/orders/:id/cancel", authAdmin, controller.cancelOrder);
 
 router.post("/products", authAdmin, controller.createProduct);
 router.put("/products/:id", authAdmin, controller.updateProduct);

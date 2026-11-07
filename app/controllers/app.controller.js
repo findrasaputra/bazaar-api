@@ -2,8 +2,7 @@ const db = require("../models");
 const catalog = require("../services/catalog");
 const wallet = require("../services/wallet");
 const { getUserId } = require("../middleware/authApp");
-
-const Op = db.Sequelize.Op;
+const config = require("../../config/business.config");
 
 async function currentUser(req) {
   return db.appUser.findOne({ where: { externalId: getUserId(req) } });
@@ -11,6 +10,11 @@ async function currentUser(req) {
 
 async function lockCurrentUser(req, transaction) {
   return db.appUser.findOne({ where: { externalId: getUserId(req) }, transaction, lock: transaction.LOCK.UPDATE });
+}
+
+function parseQuantity(value) {
+  const quantity = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  return Number.isInteger(quantity) && quantity >= 1 ? quantity : null;
 }
 
 exports.syncCustomer = async (req, res) => {
@@ -50,7 +54,10 @@ exports.getProducts = async (req, res) => {
 };
 
 exports.getProduct = async (req, res) => {
-  const product = await db.product.findByPk(req.params.id, { include: [db.variation, db.review] });
+  const product = await db.product.findOne({
+    where: { id: req.params.id, isActive: true },
+    include: [db.variation, db.review],
+  });
   if (!product) {
     return res.status(404).send({ message: "Product not found" });
   }
@@ -77,22 +84,41 @@ exports.getCart = async (req, res) => {
 };
 
 exports.addToCart = async (req, res) => {
+  const { productId, variationId } = req.body;
+  const quantity = parseQuantity(req.body.quantity);
+  if (!quantity) {
+    return res.status(400).send({ message: "Quantity must be a whole number of at least 1" });
+  }
+
   const t = await db.sequelize.transaction();
   try {
     const user = await lockCurrentUser(req, t);
-    const { productId, variationId, quantity } = req.body;
     const product = await db.product.findByPk(productId, { transaction: t });
     if (!product || !product.isActive) {
       await t.rollback();
       return res.status(404).send({ message: "Product not found" });
+    }
+    let variation = null;
+    if (variationId) {
+      variation = await db.variation.findOne({ where: { id: variationId, productId: product.id }, transaction: t });
+      if (!variation) {
+        await t.rollback();
+        return res.status(404).send({ message: "Variation not found" });
+      }
     }
 
     const existing = await db.cartItem.findOne({
       where: { userId: user.id, productId, variationId: variationId || null },
       transaction: t,
     });
+    const newQuantity = (existing ? existing.quantity : 0) + quantity;
+    if (newQuantity > product.stock || (variation && newQuantity > variation.stock)) {
+      await t.rollback();
+      return res.status(400).send({ message: "Not enough stock" });
+    }
+
     if (existing) {
-      existing.quantity = existing.quantity + quantity;
+      existing.quantity = newQuantity;
       await existing.save({ transaction: t });
       await t.commit();
       return res.send(existing);
@@ -115,41 +141,89 @@ exports.addToCart = async (req, res) => {
 
 exports.checkout = async (req, res) => {
   const t = await db.sequelize.transaction();
+  const reject = async (status, message) => {
+    await t.rollback();
+    return res.status(status).send({ message });
+  };
   try {
     const user = await lockCurrentUser(req, t);
     const { addressId, staffCode } = req.body;
 
-    const items = await db.cartItem.findAll({ where: { userId: user.id }, transaction: t });
+    // Sorted so concurrent checkouts lock product rows in the same order.
+    const items = await db.cartItem.findAll({
+      where: { userId: user.id },
+      order: [["productId", "ASC"], ["variationId", "ASC"]],
+      transaction: t,
+    });
     if (!items.length) {
-      await t.rollback();
-      return res.status(400).send({ message: "Cart is empty" });
+      return reject(400, "Cart is empty");
     }
+    if (items.some((cartItem) => !parseQuantity(cartItem.quantity))) {
+      return reject(400, "Cart contains an invalid quantity");
+    }
+
+    let shippingFee = config.shippingFee();
+    // Lock the wallet before the products, the same order cancellations use.
+    const balance = await wallet.getBalance(user.id, t);
 
     let subtotal = 0;
     let merchantId = null;
     const lineItems = [];
+    const lines = [];
+    const reserved = {};
     for (const cartItem of items) {
-      const product = await db.product.findByPk(cartItem.productId, { transaction: t });
-      const { data } = await catalog.get(`/products/${product.catalogProductId}`);
-      subtotal += parseFloat(data.price) * cartItem.quantity;
+      const product = await db.product.findByPk(cartItem.productId, { transaction: t, lock: t.LOCK.UPDATE });
+      if (!product || !product.isActive) {
+        return reject(400, "A product in your cart is no longer available");
+      }
+      if (merchantId !== null && product.merchantId !== merchantId) {
+        return reject(400, "Products from different stores must be checked out separately");
+      }
       merchantId = product.merchantId;
+
+      reserved[product.id] = (reserved[product.id] || 0) + cartItem.quantity;
+      if (reserved[product.id] > product.stock) {
+        return reject(400, `Not enough stock for ${product.name}`);
+      }
+      let variation = null;
+      if (cartItem.variationId) {
+        variation = await db.variation.findOne({
+          where: { id: cartItem.variationId, productId: product.id },
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+        if (!variation || cartItem.quantity > variation.stock) {
+          return reject(400, `Not enough stock for ${product.name}`);
+        }
+      }
+
+      const { data } = await catalog.get(`/products/${product.catalogProductId}`);
+      const price = parseFloat(data.price);
+      subtotal += price * cartItem.quantity;
       lineItems.push({ product_id: product.catalogProductId, quantity: cartItem.quantity, price: data.price });
+      lines.push({ cartItem, product, variation, price });
     }
 
-    let shippingFee = parseFloat(process.env.SHIPPING_FEE);
     let staff = null;
-    if (staffCode) {
-      staff = await db.staff.findOne({ where: { code: { [Op.iLike]: staffCode } }, transaction: t });
+    if (typeof staffCode === "string" && staffCode) {
+      staff = await db.staff.findOne({ where: { code: staffCode }, transaction: t });
       if (staff) {
         shippingFee = 0;
       }
     }
     const total = subtotal + shippingFee;
-
-    const balance = await wallet.getBalance(user.id, t);
+    if (!(total > 0)) {
+      return reject(400, "Order total must be greater than zero");
+    }
     if (balance < total) {
-      await t.rollback();
-      return res.status(400).send({ message: "Insufficient balance" });
+      return reject(400, "Insufficient balance");
+    }
+
+    for (const line of lines) {
+      await line.product.decrement("stock", { by: line.cartItem.quantity, transaction: t });
+      if (line.variation) {
+        await line.variation.decrement("stock", { by: line.cartItem.quantity, transaction: t });
+      }
     }
 
     const address = await db.address.findByPk(addressId, { transaction: t });
@@ -164,30 +238,25 @@ exports.checkout = async (req, res) => {
       userId: user.id,
       merchantId,
       catalogOrderId: catalogOrder.id,
-      status: staff ? "completed" : "paid",
+      status: "paid",
       subtotal,
       shippingFee,
       total,
       staffCode: staff ? staff.code : null,
       paidAt: new Date(),
-      completedAt: staff ? new Date() : null,
     }, { transaction: t });
 
-    for (const cartItem of items) {
+    for (const { cartItem, price } of lines) {
       await db.orderItem.create({
         orderId: order.id,
         productId: cartItem.productId,
         variationId: cartItem.variationId,
         quantity: cartItem.quantity,
-        price: cartItem.price,
+        price,
       }, { transaction: t });
     }
 
     await wallet.hold(user.id, order.id, total, t);
-    if (staff) {
-      await wallet.capture(user.id, order.id, total, t);
-      await wallet.grantBonus(user.id, order.id, Math.floor(total / 10), t);
-    }
     await db.cartItem.destroy({ where: { userId: user.id }, transaction: t });
     await t.commit();
 
@@ -257,8 +326,6 @@ exports.requestCancel = async (req, res) => {
       return res.status(400).send({ message: "Order can no longer be cancelled" });
     }
 
-    await catalog.put(`/orders/${order.catalogOrderId}`, { status: "cancelled" });
-
     order.status = "cancel_requested";
     order.cancelReason = req.body.reason;
     await order.save();
@@ -293,11 +360,20 @@ exports.createReview = async (req, res) => {
   try {
     const user = await currentUser(req);
     const { productId, orderId, rating, comment } = req.body;
-    if (!rating) {
-      res.status(400).send({ message: "Rating is required" });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).send({ message: "Rating must be a whole number from 1 to 5" });
     }
-    if (rating > 5) {
-      return res.status(400).send({ message: "Rating must be 5 or less" });
+
+    const purchased = await db.orderItem.findOne({
+      where: { orderId, productId },
+      include: [{ model: db.order, where: { userId: user.id, status: "completed" } }],
+    });
+    if (!purchased) {
+      return res.status(403).send({ message: "You can only review products from your completed orders" });
+    }
+    const reviewed = await db.review.findOne({ where: { userId: user.id, orderId, productId } });
+    if (reviewed) {
+      return res.status(409).send({ message: "You have already reviewed this product for this order" });
     }
 
     const review = await db.review.create({
@@ -313,6 +389,9 @@ exports.createReview = async (req, res) => {
     await db.product.update({ ratingAvg: avg }, { where: { id: productId } });
     res.send(review);
   } catch (err) {
+    if (err instanceof db.Sequelize.UniqueConstraintError) {
+      return res.status(409).send({ message: "You have already reviewed this product for this order" });
+    }
     res.status(500).send({ message: err.message });
   }
 };

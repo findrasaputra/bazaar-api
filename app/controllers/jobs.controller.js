@@ -1,12 +1,13 @@
 const moment = require("moment");
 const db = require("../models");
 const wallet = require("../services/wallet");
+const config = require("../../config/business.config");
 
 const Op = db.Sequelize.Op;
 
 exports.completeOrders = async (req, res) => {
   try {
-    const cutoff = moment().subtract(process.env.ORDER_COMPLETE_DAYS, "days").toDate();
+    const cutoff = moment().subtract(config.orderCompleteDays(), "days").toDate();
     const orders = await db.order.findAll({
       where: { status: "delivered", deliveredAt: { [Op.lte]: cutoff } },
     });
@@ -38,23 +39,31 @@ exports.closing14Days = async (req, res) => {
     const start = end.clone().subtract(14, "days");
     const merchants = await db.merchant.findAll({ where: { isActive: true } });
 
+    let created = 0;
     for (const merchant of merchants) {
+      const period = { merchantId: merchant.id, periodStart: start.toDate(), periodEnd: end.toDate() };
+      if (await db.payout.findOne({ where: period })) {
+        continue;
+      }
+      // Half-open window [start, end) so an order on the boundary is paid out once.
       const total = await db.order.sum("total", {
         where: {
           merchantId: merchant.id,
           status: "completed",
-          completedAt: { [Op.between]: [start.toDate(), end.toDate()] },
+          completedAt: { [Op.gte]: start.toDate(), [Op.lt]: end.toDate() },
         },
       });
       const amount = (total || 0) * (1 - parseFloat(merchant.commissionRate));
-      await db.payout.create({
-        merchantId: merchant.id,
-        periodStart: start.toDate(),
-        periodEnd: end.toDate(),
-        amount,
-      });
+      try {
+        await db.payout.create({ ...period, amount });
+        created++;
+      } catch (err) {
+        if (!(err instanceof db.Sequelize.UniqueConstraintError)) {
+          throw err;
+        }
+      }
     }
-    res.send({ merchants: merchants.length });
+    res.send({ merchants: merchants.length, created });
   } catch (err) {
     res.status(500).send({ message: err.message });
   }

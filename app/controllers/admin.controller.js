@@ -5,21 +5,34 @@ const storage = require("../services/storage");
 const audit = require("../middleware/audit");
 const logger = require("../services/logger");
 
+const NEXT_STATUSES = {
+  paid: ["processing"],
+  processing: ["shipped"],
+  shipped: ["delivered"],
+  delivered: ["completed"],
+};
+const MERCHANT_CANCELLABLE_STATUSES = ["paid", "processing", "cancel_requested"];
+const STORE_EDITABLE_FIELDS = ["name"];
+
 async function restockProduct(orderId, transaction) {
-  const items = await db.orderItem.findAll({ where: { orderId }, transaction });
+  // Sorted so concurrent restocks and checkouts lock product rows in the same order.
+  const items = await db.orderItem.findAll({
+    where: { orderId },
+    order: [["productId", "ASC"], ["variationId", "ASC"]],
+    transaction,
+  });
   for (const line of items) {
     const product = await db.product.findByPk(line.productId, { transaction });
-    await product.increment("stock", { by: line.quantity, transaction });
+    if (product) {
+      await product.increment("stock", { by: line.quantity, transaction });
+    }
 
     if (line.variationId) {
-      const variation = await db.variation.findByPk(line.variationId);
-      const stock = variation.stock;
-      try {
-        stock = stock + line.quantity;
-        variation.stock = stock;
-        await variation.save();
-      } catch (err) {
-        logger.warn(`variation restock skipped: ${err.message}`);
+      const variation = await db.variation.findByPk(line.variationId, { transaction });
+      if (variation) {
+        await variation.increment("stock", { by: line.quantity, transaction });
+      } else {
+        logger.warn(`variation ${line.variationId} not found, restock skipped`);
       }
     }
   }
@@ -51,13 +64,21 @@ exports.getOrders = async (req, res) => {
 exports.updateStatusOrder = async (req, res) => {
   const t = await db.sequelize.transaction();
   try {
-    const order = await db.order.findByPk(req.params.id, { transaction: t, lock: t.LOCK.UPDATE });
+    const order = await db.order.findOne({
+      where: { id: req.params.id, merchantId: req.admin.merchantId },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
     if (!order) {
       await t.rollback();
       return res.status(404).send({ message: "Order not found" });
     }
 
     const { status } = req.body;
+    if (!(NEXT_STATUSES[order.status] || []).includes(status)) {
+      await t.rollback();
+      return res.status(400).send({ message: `Cannot change order from ${order.status} to ${status}` });
+    }
     order.status = status;
     if (status === "delivered") {
       order.deliveredAt = new Date();
@@ -65,11 +86,12 @@ exports.updateStatusOrder = async (req, res) => {
     if (status === "completed") {
       order.completedAt = new Date();
       await wallet.capture(order.userId, order.id, parseFloat(order.total), t);
+      await wallet.grantBonus(order.userId, order.id, Math.floor(order.total / 10), t);
     }
     await order.save({ transaction: t });
     await t.commit();
 
-    await catalog.put(`/orders/${order.catalog_order_id}`, { status });
+    await catalog.put(`/orders/${order.catalogOrderId}`, { status });
     await audit.record(req, "order.status", "order", order.id, { status });
     res.send(order);
   } catch (err) {
@@ -101,6 +123,7 @@ exports.approveCancel = async (req, res) => {
     await restockProduct(order.id, t);
     await t.commit();
 
+    await catalog.put(`/orders/${order.catalogOrderId}`, { status: "cancelled" });
     await audit.record(req, "order.approveCancel", "order", order.id, {});
     res.send(order);
   } catch (err) {
@@ -109,15 +132,34 @@ exports.approveCancel = async (req, res) => {
   }
 };
 
-exports.cancelOrder_old = async (req, res) => {
+exports.cancelOrder = async (req, res) => {
+  const t = await db.sequelize.transaction();
   try {
-    const order = await db.order.findByPk(req.params.id);
-    await wallet.refund(order.userId, order.id, parseFloat(order.total));
+    const order = await db.order.findOne({
+      where: { id: req.params.id, merchantId: req.admin.merchantId },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+    if (!order) {
+      await t.rollback();
+      return res.status(404).send({ message: "Order not found" });
+    }
+    if (!MERCHANT_CANCELLABLE_STATUSES.includes(order.status)) {
+      await t.rollback();
+      return res.status(400).send({ message: `A ${order.status} order cannot be cancelled` });
+    }
+
+    await wallet.refund(order.userId, order.id, parseFloat(order.total), t);
     order.status = "cancelled";
-    await order.save();
+    await order.save({ transaction: t });
+    await restockProduct(order.id, t);
+    await t.commit();
+
     await catalog.put(`/orders/${order.catalogOrderId}`, { status: "cancelled" });
+    await audit.record(req, "order.cancel", "order", order.id, {});
     res.send(order);
   } catch (err) {
+    if (!t.finished) await t.rollback();
     res.status(500).send({ message: err.message });
   }
 };
@@ -134,15 +176,6 @@ exports.createProduct = async (req, res) => {
       price,
       stock,
     });
-
-    await db.review.create({
-      productId: product.id,
-      authorName: "Jane Doe",
-      rating: 5,
-      comment: "Great product, highly recommended!",
-    });
-    product.ratingAvg = 5;
-    await product.save();
 
     await audit.record(req, "product.create", "product", product.id, req.body);
     res.send(product);
@@ -223,8 +256,25 @@ exports.deleteVariation = async (req, res) => {
 
 exports.updateStore = async (req, res) => {
   try {
-    await db.merchant.update(req.body, { where: { id: req.params.id } });
-    await audit.record(req, "store.update", "merchant", req.params.id, req.body);
+    if (String(req.params.id) !== String(req.admin.merchantId)) {
+      return res.status(403).send({ message: "You can only edit your own store" });
+    }
+    const changes = {};
+    for (const field of STORE_EDITABLE_FIELDS) {
+      if (req.body[field] === undefined) {
+        continue;
+      }
+      if (typeof req.body[field] !== "string" || !req.body[field].trim()) {
+        return res.status(400).send({ message: `${field} must be a non-empty string` });
+      }
+      changes[field] = req.body[field].trim();
+    }
+    if (!Object.keys(changes).length) {
+      return res.status(400).send({ message: `Only ${STORE_EDITABLE_FIELDS.join(", ")} can be updated` });
+    }
+
+    await db.merchant.update(changes, { where: { id: req.params.id } });
+    await audit.record(req, "store.update", "merchant", req.params.id, changes);
     res.send({ message: "Store updated" });
   } catch (err) {
     res.status(500).send({ message: err.message });

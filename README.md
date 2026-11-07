@@ -79,4 +79,5 @@ Seed data includes two merchants, three products, two app users (`user-alice`,
   `PARTNER_USER`/`PARTNER_PASS`.
 - **Webhooks** (`/api/webhooks/catalog/...`) receive product events from the catalog
   platform.
-- **Jobs** (`/api/jobs/...`) are triggered by the scheduler.
+- **Jobs** (`/api/jobs/...`) are triggered by the scheduler and require an
+  `X-Job-Token` header matching `JOB_TOKEN`.

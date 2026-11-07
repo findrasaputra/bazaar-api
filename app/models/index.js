@@ -121,7 +121,10 @@ db.review = sequelize.define("review", {
   authorName: DataTypes.STRING,
   rating: DataTypes.INTEGER,
   comment: DataTypes.TEXT,
-}, { tableName: "reviews" });
+}, {
+  tableName: "reviews",
+  indexes: [{ unique: true, fields: ["userId", "orderId", "productId"] }],
+});
 
 db.staff = sequelize.define("staff", {
   code: { type: DataTypes.STRING, unique: true },
@@ -133,7 +136,10 @@ db.payout = sequelize.define("payout", {
   periodStart: DataTypes.DATE,
   periodEnd: DataTypes.DATE,
   amount: DataTypes.DECIMAL(12, 2),
-}, { tableName: "payouts" });
+}, {
+  tableName: "payouts",
+  indexes: [{ unique: true, fields: ["merchantId", "periodStart", "periodEnd"] }],
+});
 
 db.appLog = sequelize.define("appLog", {
   userId: DataTypes.STRING,
