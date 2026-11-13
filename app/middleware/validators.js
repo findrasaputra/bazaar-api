@@ -2,7 +2,10 @@ const ROLES = ["admin", "merchant", "staff"];
 const ORDER_STATUSES = ["pending", "paid", "processing", "shipped", "delivered", "completed", "cancel_requested", "cancelled"];
 
 exports.checkRolesExisted = (req, res, next) => {
-  if (req.body.roles) {
+  if (req.body.roles !== undefined) {
+    if (!Array.isArray(req.body.roles) || req.body.roles.length !== 1) {
+      return res.status(400).send({ message: "roles must be a list with exactly one role" });
+    }
     for (let i = 0; i < req.body.roles.length; i++) {
       if (!ROLES.includes(req.body.roles[i])) {
         return res.status(400).send({ message: `Role ${req.body.roles[i]} does not exist` });

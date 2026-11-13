@@ -1,15 +1,62 @@
+const crypto = require("crypto");
 const db = require("../models");
 const catalog = require("../services/catalog");
 const wallet = require("../services/wallet");
 const { getUserId } = require("../middleware/authApp");
 const config = require("../../config/business.config");
 
+const ADDRESS_FIELDS = ["label", "recipient", "phone", "line1", "city", "postcode"];
+const STAFF_CODE_MAX_FAILURES = 5;
+const STAFF_CODE_WINDOW_MS = 15 * 60 * 1000;
+// userId -> { count, resetAt }. Per process; enough to stop guessing from one account.
+const staffCodeFailures = new Map();
+
+// verifyToken has already resolved the caller from the auth service.
 async function currentUser(req) {
-  return db.appUser.findOne({ where: { externalId: getUserId(req) } });
+  return req.appUser;
 }
 
 async function lockCurrentUser(req, transaction) {
-  return db.appUser.findOne({ where: { externalId: getUserId(req) }, transaction, lock: transaction.LOCK.UPDATE });
+  return db.appUser.findByPk(req.appUser.id, { transaction, lock: transaction.LOCK.UPDATE });
+}
+
+function positiveId(value) {
+  const text = String(value);
+  return /^[1-9]\d*$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : null;
+}
+
+// Returns the address fields to save, or an error message.
+function addressFields(body) {
+  const fields = {};
+  for (const field of ADDRESS_FIELDS) {
+    if (!body || body[field] === undefined) {
+      continue;
+    }
+    if (body[field] !== null && typeof body[field] !== "string") {
+      return { error: `${field} must be a string` };
+    }
+    fields[field] = body[field];
+  }
+  return { fields };
+}
+
+function staffCodeBlocked(userId) {
+  const entry = staffCodeFailures.get(userId);
+  if (entry && entry.resetAt <= Date.now()) {
+    staffCodeFailures.delete(userId);
+    return false;
+  }
+  return Boolean(entry && entry.count >= STAFF_CODE_MAX_FAILURES);
+}
+
+function recordStaffCodeFailure(userId) {
+  const now = Date.now();
+  const entry = staffCodeFailures.get(userId);
+  if (entry && entry.resetAt > now) {
+    entry.count++;
+  } else {
+    staffCodeFailures.set(userId, { count: 1, resetAt: now + STAFF_CODE_WINDOW_MS });
+  }
 }
 
 function parseQuantity(value) {
@@ -29,7 +76,9 @@ exports.syncCustomer = async (req, res) => {
       email: user.email,
       first_name: user.name,
       username: user.email,
-      password: "default",
+      // Each account gets its own unguessable password; customers sign in to the
+      // storefront through "forgot password".
+      password: crypto.randomBytes(24).toString("base64url"),
     });
     user.catalogCustomerId = data.id;
     await user.save({ transaction: t });
@@ -140,6 +189,17 @@ exports.addToCart = async (req, res) => {
 };
 
 exports.checkout = async (req, res) => {
+  const { addressId, staffCode } = req.body;
+  if (staffCode !== undefined && staffCode !== null && staffCode !== "" && typeof staffCode !== "string") {
+    return res.status(400).send({ message: "Invalid staff code" });
+  }
+  if (staffCode && staffCodeBlocked(req.appUser.id)) {
+    return res.status(429).send({ message: "Too many invalid staff codes, try again later" });
+  }
+  if (!positiveId(addressId)) {
+    return res.status(400).send({ message: "A shipping address is required" });
+  }
+
   const t = await db.sequelize.transaction();
   const reject = async (status, message) => {
     await t.rollback();
@@ -147,7 +207,6 @@ exports.checkout = async (req, res) => {
   };
   try {
     const user = await lockCurrentUser(req, t);
-    const { addressId, staffCode } = req.body;
 
     // Sorted so concurrent checkouts lock product rows in the same order.
     const items = await db.cartItem.findAll({
@@ -160,6 +219,18 @@ exports.checkout = async (req, res) => {
     }
     if (items.some((cartItem) => !parseQuantity(cartItem.quantity))) {
       return reject(400, "Cart contains an invalid quantity");
+    }
+    const address = await db.address.findOne({ where: { id: addressId, userId: user.id }, transaction: t });
+    if (!address) {
+      return reject(404, "Address not found");
+    }
+    let staff = null;
+    if (staffCode) {
+      staff = await db.staff.findOne({ where: { code: staffCode }, transaction: t });
+      if (!staff) {
+        recordStaffCodeFailure(user.id);
+        return reject(400, "Invalid staff code");
+      }
     }
 
     let shippingFee = config.shippingFee();
@@ -204,12 +275,8 @@ exports.checkout = async (req, res) => {
       lines.push({ cartItem, product, variation, price });
     }
 
-    let staff = null;
-    if (typeof staffCode === "string" && staffCode) {
-      staff = await db.staff.findOne({ where: { code: staffCode }, transaction: t });
-      if (staff) {
-        shippingFee = 0;
-      }
+    if (staff) {
+      shippingFee = 0;
     }
     const total = subtotal + shippingFee;
     if (!(total > 0)) {
@@ -226,7 +293,6 @@ exports.checkout = async (req, res) => {
       }
     }
 
-    const address = await db.address.findByPk(addressId, { transaction: t });
     const { data: catalogOrder } = await catalog.post("/orders", {
       customer_id: user.catalogCustomerId,
       line_items: lineItems,
@@ -408,7 +474,8 @@ exports.getAddresses = async (req, res) => {
 
 exports.getAddress = async (req, res) => {
   try {
-    const address = await db.address.findByPk(req.params.id);
+    const id = positiveId(req.params.id);
+    const address = id && await db.address.findOne({ where: { id, userId: req.appUser.id } });
     if (!address) {
       return res.status(404).send({ message: "Address not found" });
     }
@@ -421,7 +488,11 @@ exports.getAddress = async (req, res) => {
 exports.createAddress = async (req, res) => {
   try {
     const user = await currentUser(req);
-    const address = await db.address.create({ ...req.body, userId: user.id });
+    const { fields, error } = addressFields(req.body);
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+    const address = await db.address.create({ ...fields, userId: user.id });
     res.send(address);
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -430,7 +501,19 @@ exports.createAddress = async (req, res) => {
 
 exports.updateAddress = async (req, res) => {
   try {
-    await db.address.update(req.body, { where: { id: req.params.id } });
+    const id = positiveId(req.params.id);
+    const address = id && await db.address.findOne({ where: { id, userId: req.appUser.id } });
+    if (!address) {
+      return res.status(404).send({ message: "Address not found" });
+    }
+    const { fields, error } = addressFields(req.body);
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+    if (!Object.keys(fields).length) {
+      return res.status(400).send({ message: `Only ${ADDRESS_FIELDS.join(", ")} can be updated` });
+    }
+    await address.update(fields);
     res.send({ message: "Address updated" });
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -450,7 +533,14 @@ exports.getWishlist = async (req, res) => {
 exports.addWishlist = async (req, res) => {
   try {
     const user = await currentUser(req);
-    const item = await db.wishlist.create({ userId: user.id, productId: req.body.productId });
+    const productId = positiveId(req.body.productId);
+    if (!productId) {
+      return res.status(400).send({ message: "productId must be a positive whole number" });
+    }
+    if (!(await db.product.findOne({ where: { id: productId, isActive: true } }))) {
+      return res.status(404).send({ message: "Product not found" });
+    }
+    const item = await db.wishlist.create({ userId: user.id, productId });
     res.send(item);
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -459,7 +549,11 @@ exports.addWishlist = async (req, res) => {
 
 exports.deleteWishlist = async (req, res) => {
   try {
-    await db.wishlist.destroy({ where: { id: req.params.id } });
+    const id = positiveId(req.params.id);
+    const removed = id ? await db.wishlist.destroy({ where: { id, userId: req.appUser.id } }) : 0;
+    if (!removed) {
+      return res.status(404).send({ message: "Wishlist item not found" });
+    }
     res.send({ message: "Removed from wishlist" });
   } catch (err) {
     res.status(500).send({ message: err.message });

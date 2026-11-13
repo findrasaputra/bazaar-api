@@ -5,14 +5,76 @@ const storage = require("../services/storage");
 const audit = require("../middleware/audit");
 const logger = require("../services/logger");
 
-const NEXT_STATUSES = {
+// Stores only move an order forward to processing and shipped. "delivered" comes
+// from the delivery partner, "completed" from the buyer or the completion job.
+const STORE_SETTABLE_STATUSES = {
   paid: ["processing"],
   processing: ["shipped"],
-  shipped: ["delivered"],
-  delivered: ["completed"],
 };
 const MERCHANT_CANCELLABLE_STATUSES = ["paid", "processing", "cancel_requested"];
 const STORE_EDITABLE_FIELDS = ["name"];
+const PRODUCT_EDITABLE_FIELDS = ["name", "description", "price", "isActive"];
+const CATALOG_PRODUCT_FIELDS = ["name", "description", "short_description", "regular_price", "sale_price", "stock_quantity"];
+const STORE_ROLES = ["merchant", "staff"];
+
+function positiveId(value) {
+  const text = String(value);
+  return /^[1-9]\d*$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : null;
+}
+
+// Platform admins act on every store; everyone else only on their own.
+function storeScope(req) {
+  return req.admin.role === "admin" ? {} : { merchantId: req.admin.merchantId };
+}
+
+function pick(body, fields) {
+  const picked = {};
+  for (const field of fields) {
+    if (body && body[field] !== undefined) {
+      picked[field] = body[field];
+    }
+  }
+  return picked;
+}
+
+function toPrice(value) {
+  const price = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  return typeof price === "number" && Number.isFinite(price) && price > 0 ? price : null;
+}
+
+// Returns the validated product changes, or an error message.
+function productChanges(body) {
+  const changes = pick(body, PRODUCT_EDITABLE_FIELDS);
+  if (!Object.keys(changes).length) {
+    return { error: `Only ${PRODUCT_EDITABLE_FIELDS.join(", ")} can be updated` };
+  }
+  if (changes.name !== undefined && (typeof changes.name !== "string" || !changes.name.trim())) {
+    return { error: "name must be a non-empty string" };
+  }
+  if (changes.description !== undefined && changes.description !== null && typeof changes.description !== "string") {
+    return { error: "description must be a string" };
+  }
+  if (changes.price !== undefined) {
+    changes.price = toPrice(changes.price);
+    if (changes.price === null) {
+      return { error: "price must be a number greater than zero" };
+    }
+  }
+  if (changes.isActive !== undefined && typeof changes.isActive !== "boolean") {
+    return { error: "isActive must be true or false" };
+  }
+  return { changes };
+}
+
+async function findOwnProduct(req) {
+  const id = positiveId(req.params.id);
+  return id ? db.product.findOne({ where: { id, merchantId: req.admin.merchantId } }) : null;
+}
+
+async function findProductVariation(req, product) {
+  const id = positiveId(req.params.variationId);
+  return id ? db.variation.findOne({ where: { id, productId: product.id } }) : null;
+}
 
 async function restockProduct(orderId, transaction) {
   // Sorted so concurrent restocks and checkouts lock product rows in the same order.
@@ -44,7 +106,18 @@ exports.getOrders = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 0;
     const size = parseInt(req.query.size) || 50;
-    const where = { merchantId: req.query.store || req.admin.merchantId };
+    let merchantId = req.admin.merchantId;
+    if (req.query.store !== undefined) {
+      const store = positiveId(req.query.store);
+      if (!store) {
+        return res.status(400).send({ message: "store must be a positive whole number" });
+      }
+      if (req.admin.role !== "admin" && store !== req.admin.merchantId) {
+        return res.status(403).send({ message: "You can only view your own store's orders" });
+      }
+      merchantId = store;
+    }
+    const where = merchantId ? { merchantId } : {};
     if (req.query.status) {
       where.status = req.query.status;
     }
@@ -65,7 +138,7 @@ exports.updateStatusOrder = async (req, res) => {
   const t = await db.sequelize.transaction();
   try {
     const order = await db.order.findOne({
-      where: { id: req.params.id, merchantId: req.admin.merchantId },
+      where: { id: req.params.id, ...storeScope(req) },
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -75,19 +148,11 @@ exports.updateStatusOrder = async (req, res) => {
     }
 
     const { status } = req.body;
-    if (!(NEXT_STATUSES[order.status] || []).includes(status)) {
+    if (!(STORE_SETTABLE_STATUSES[order.status] || []).includes(status)) {
       await t.rollback();
       return res.status(400).send({ message: `Cannot change order from ${order.status} to ${status}` });
     }
     order.status = status;
-    if (status === "delivered") {
-      order.deliveredAt = new Date();
-    }
-    if (status === "completed") {
-      order.completedAt = new Date();
-      await wallet.capture(order.userId, order.id, parseFloat(order.total), t);
-      await wallet.grantBonus(order.userId, order.id, Math.floor(order.total / 10), t);
-    }
     await order.save({ transaction: t });
     await t.commit();
 
@@ -104,7 +169,7 @@ exports.approveCancel = async (req, res) => {
   const t = await db.sequelize.transaction();
   try {
     const order = await db.order.findOne({
-      where: { id: req.params.id, merchantId: req.admin.merchantId },
+      where: { id: req.params.id, ...storeScope(req) },
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -136,7 +201,7 @@ exports.cancelOrder = async (req, res) => {
   const t = await db.sequelize.transaction();
   try {
     const order = await db.order.findOne({
-      where: { id: req.params.id, merchantId: req.admin.merchantId },
+      where: { id: req.params.id, ...storeScope(req) },
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -186,8 +251,16 @@ exports.createProduct = async (req, res) => {
 
 exports.updateProduct = async (req, res) => {
   try {
-    await db.product.update(req.body, { where: { id: req.params.id } });
-    await audit.record(req, "product.update", "product", req.params.id, req.body);
+    const product = await findOwnProduct(req);
+    if (!product) {
+      return res.status(404).send({ message: "Product not found" });
+    }
+    const { changes, error } = productChanges(req.body);
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+    await product.update(changes);
+    await audit.record(req, "product.update", "product", product.id, changes);
     res.send({ message: "Product updated" });
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -196,8 +269,12 @@ exports.updateProduct = async (req, res) => {
 
 exports.deleteProduct = async (req, res) => {
   try {
-    await db.product.destroy({ where: { id: req.params.id } });
-    await audit.record(req, "product.delete", "product", req.params.id, {});
+    const product = await findOwnProduct(req);
+    if (!product) {
+      return res.status(404).send({ message: "Product not found" });
+    }
+    await product.destroy();
+    await audit.record(req, "product.delete", "product", product.id, {});
     res.send({ message: "Product deleted" });
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -206,7 +283,10 @@ exports.deleteProduct = async (req, res) => {
 
 exports.createVariation = async (req, res) => {
   try {
-    const product = await db.product.findByPk(req.params.id);
+    const product = await findOwnProduct(req);
+    if (!product) {
+      return res.status(404).send({ message: "Product not found" });
+    }
     const { data } = await catalog.post(`/products/${product.catalogProductId}/variations`, {
       regular_price: String(req.body.price),
       stock_quantity: req.body.stock,
@@ -227,8 +307,11 @@ exports.createVariation = async (req, res) => {
 
 exports.updateVariation = async (req, res) => {
   try {
-    const product = await db.product.findByPk(req.params.id);
-    const variation = await db.variation.findByPk(req.params.variationId);
+    const product = await findOwnProduct(req);
+    const variation = product && await findProductVariation(req, product);
+    if (!variation) {
+      return res.status(404).send({ message: "Variation not found" });
+    }
     await catalog.put(`/products/${product.catalogProductId}/variations/${variation.catalogVariationId}`, {
       regular_price: String(req.body.price),
       stock_quantity: req.body.stock,
@@ -244,8 +327,11 @@ exports.updateVariation = async (req, res) => {
 
 exports.deleteVariation = async (req, res) => {
   try {
-    const product = await db.product.findByPk(req.params.id);
-    const variation = await db.variation.findByPk(req.params.variationId);
+    const product = await findOwnProduct(req);
+    const variation = product && await findProductVariation(req, product);
+    if (!variation) {
+      return res.status(404).send({ message: "Variation not found" });
+    }
     await catalog.delete(`/products/${product.catalogProductId}/variations/${variation.catalogVariationId}`);
     await variation.destroy();
     res.send({ message: "Variation deleted" });
@@ -283,13 +369,35 @@ exports.updateStore = async (req, res) => {
 
 exports.createAdmin = async (req, res) => {
   try {
-    const admin = await db.adminUser.create({
-      username: req.body.username,
-      email: req.body.email,
-      role: req.body.roles ? req.body.roles[0] : "merchant",
-      merchantId: req.body.merchantId,
-    });
-    await audit.record(req, "admin.create", "adminUser", admin.id, req.body);
+    const { username, email } = req.body;
+    if (typeof username !== "string" || !username.trim()) {
+      return res.status(400).send({ message: "username is required" });
+    }
+
+    let role;
+    let merchantId = null;
+    if (req.admin.role === "admin") {
+      role = req.body.roles ? req.body.roles[0] : "merchant";
+      if (STORE_ROLES.includes(role)) {
+        merchantId = positiveId(req.body.merchantId);
+        if (!merchantId || !(await db.merchant.findByPk(merchantId))) {
+          return res.status(400).send({ message: "A merchant or staff account needs an existing merchantId" });
+        }
+      }
+    } else {
+      // Store owners may only add staff to their own store.
+      role = req.body.roles ? req.body.roles[0] : "staff";
+      if (role !== "staff") {
+        return res.status(403).send({ message: "You can only create staff accounts" });
+      }
+      if (req.body.merchantId !== undefined && positiveId(req.body.merchantId) !== req.admin.merchantId) {
+        return res.status(403).send({ message: "You can only add staff to your own store" });
+      }
+      merchantId = req.admin.merchantId;
+    }
+
+    const admin = await db.adminUser.create({ username: username.trim(), email, role, merchantId });
+    await audit.record(req, "admin.create", "adminUser", admin.id, { username: admin.username, role, merchantId });
     res.send(admin);
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -310,7 +418,19 @@ exports.uploadBanners = async (req, res) => {
 
 exports.getCatalogCustomer = async (req, res) => {
   try {
-    const { data } = await catalog.get(`/customers/${req.params.id}`);
+    const id = positiveId(req.params.id);
+    if (!id) {
+      return res.status(400).send({ message: "Customer id must be a positive whole number" });
+    }
+    if (req.admin.role !== "admin") {
+      // A store may only look up customers who ordered from it.
+      const user = await db.appUser.findOne({ where: { catalogCustomerId: id } });
+      const order = user && await db.order.findOne({ where: { userId: user.id, merchantId: req.admin.merchantId } });
+      if (!order) {
+        return res.status(404).send({ message: "Customer not found" });
+      }
+    }
+    const { data } = await catalog.get(`/customers/${id}`);
     res.send(data);
   } catch (err) {
     res.status(err.response ? err.response.status : 500).send(err.response ? err.response.data : err.message);
@@ -319,7 +439,19 @@ exports.getCatalogCustomer = async (req, res) => {
 
 exports.updateCatalogProduct = async (req, res) => {
   try {
-    const { data } = await catalog.put(`/products/${req.params.id}`, req.body);
+    const id = positiveId(req.params.id);
+    if (!id) {
+      return res.status(400).send({ message: "Product id must be a positive whole number" });
+    }
+    const product = await db.product.findOne({ where: { catalogProductId: id, merchantId: req.admin.merchantId } });
+    if (!product) {
+      return res.status(404).send({ message: "Product not found" });
+    }
+    const changes = pick(req.body, CATALOG_PRODUCT_FIELDS);
+    if (!Object.keys(changes).length) {
+      return res.status(400).send({ message: `Only ${CATALOG_PRODUCT_FIELDS.join(", ")} can be updated` });
+    }
+    const { data } = await catalog.put(`/products/${id}`, changes);
     res.send(data);
   } catch (err) {
     res.status(err.response ? err.response.status : 500).send(err.response ? err.response.data : err.message);

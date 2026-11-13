@@ -1,5 +1,5 @@
 const express = require("express");
-const { verifyToken } = require("../middleware/authApp");
+const { verifyToken, optionalToken } = require("../middleware/authApp");
 const controller = require("../controllers/app.controller");
 
 const router = express.Router();
@@ -22,13 +22,13 @@ router.post("/reviews", verifyToken, controller.createReview);
 
 router.get("/addresses", verifyToken, controller.getAddresses);
 router.post("/addresses", verifyToken, controller.createAddress);
-router.get("/addresses/:id", controller.getAddress);
+router.get("/addresses/:id", verifyToken, controller.getAddress);
 router.put("/addresses/:id", verifyToken, controller.updateAddress);
 
 router.get("/wishlist", verifyToken, controller.getWishlist);
-router.post("/wishlist", controller.addWishlist);
+router.post("/wishlist", verifyToken, controller.addWishlist);
 router.delete("/wishlist/:id", verifyToken, controller.deleteWishlist);
 
-router.post("/logs", controller.logEvent);
+router.post("/logs", optionalToken, controller.logEvent);
 
 module.exports = router;

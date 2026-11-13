@@ -1,4 +1,5 @@
 // Local stand-in for the catalog platform and the auth service, for development only.
+const crypto = require("crypto");
 const express = require("express");
 
 const app = express();
@@ -45,13 +46,41 @@ app.delete("/catalog/products/:pid/variations/:id", (req, res) => {
   delete store.variations[req.params.id];
   res.send({ deleted: true });
 });
-app.post("/catalog/customers", create("customers"));
-app.get("/catalog/customers/:id", read("customers"));
+// Like WooCommerce, customer passwords are stored but never returned.
+const withoutPassword = ({ password, ...customer }) => customer;
+app.post("/catalog/customers", (req, res) => {
+  const id = nextId++;
+  store.customers[id] = { id, ...req.body };
+  res.status(201).send(withoutPassword(store.customers[id]));
+});
+app.get("/catalog/customers/:id", (req, res) => {
+  const customer = store.customers[req.params.id];
+  if (!customer) return res.status(404).send({ code: "not_found", message: "Invalid ID." });
+  res.send(withoutPassword(customer));
+});
 app.post("/catalog/orders", create("orders"));
 app.put("/catalog/orders/:id", update("orders"));
 
-app.post("/auth/introspect", (req, res) => {
-  res.send({ active: Boolean(req.body.token) });
+// Auth service. Only tokens issued by /auth/login are active, so tokens cannot be
+// hand-crafted. Tokens live in memory and are lost when the mock restarts.
+// /auth/login has no password: it is a development stand-in for the real login.
+const tokens = new Map();
+const MOCK_CLIENT_ID = process.env.MOCK_CLIENT_ID || "bazaar-mobile";
+
+app.post("/auth/login", (req, res) => {
+  const { externalId } = req.body || {};
+  if (typeof externalId !== "string" || !externalId) {
+    return res.status(400).send({ message: "externalId is required" });
+  }
+  const token = crypto.randomBytes(24).toString("hex");
+  tokens.set(token, { sub: externalId, client_id: MOCK_CLIENT_ID });
+  res.send({ access_token: token, token_type: "Bearer" });
 });
 
-app.listen(9000, () => console.log("mock upstream listening on 9000"));
+app.post("/auth/introspect", (req, res) => {
+  const session = tokens.get(req.body && req.body.token);
+  res.send(session ? { active: true, ...session } : { active: false });
+});
+
+const port = Number(process.env.MOCK_PORT) || 9000;
+app.listen(port, () => console.log(`mock upstream listening on ${port}`));

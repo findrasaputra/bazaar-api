@@ -1,6 +1,6 @@
 {
   "name": "bazaar-api",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Marketplace backend for the Bazaar mobile app and merchant admin portal",
   "main": "server.js",
   "scripts": {

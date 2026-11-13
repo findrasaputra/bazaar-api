@@ -9,7 +9,15 @@ const requestLogger = require("./app/middleware/requestLogger");
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({
+  limit: "50mb",
+  // Webhook signatures are computed over the exact bytes the sender posted.
+  verify: (req, res, buf) => {
+    if (req.originalUrl.startsWith("/api/webhooks/")) {
+      req.rawBody = buf;
+    }
+  },
+}));
 app.use(express.urlencoded({ extended: true }));
 app.use(requestLogger);
 
