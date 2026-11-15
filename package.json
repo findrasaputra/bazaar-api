@@ -2,6 +2,7 @@
   "name": "bazaar-api",
   "version": "1.5.0",
   "description": "Marketplace backend for the Bazaar mobile app and merchant admin portal",
+  "author": "Fino Indrasaputra",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

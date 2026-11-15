@@ -112,3 +112,7 @@ Seed data includes two merchants, three products, two app users (`user-alice`,
 - Catalog customer accounts created before version 1.5.0 share the password
   `default`. New accounts get a random password. Force a password reset for the
   older accounts in the catalog (WooCommerce) admin.
+
+## License
+
+[MIT](LICENSE) © Fino Indrasaputra
